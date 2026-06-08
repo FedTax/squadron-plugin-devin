@@ -102,12 +102,51 @@ var tools = map[string]*squadron.ToolInfo{
 			Required: []string{"session_id"},
 		},
 	},
+	"send_message": {
+		Name: "send_message",
+		Description: "Send a follow-up message to an existing Devin session and wait for " +
+			"Devin to finish responding. Use this to continue a conversation with a session " +
+			"that is waiting for user input, for example to answer a question, give additional " +
+			"instructions, or request changes. The session must not be archived. " +
+			"Returns Devin's response once it finishes the follow-up work.",
+		Schema: squadron.Schema{
+			Type: squadron.TypeObject,
+			Properties: squadron.PropertyMap{
+				"session_id": {
+					Type:        squadron.TypeString,
+					Description: "The Devin session ID to send the message to (e.g. 32fee96e7997499ca010301aa50eefce)",
+				},
+				"message": {
+					Type:        squadron.TypeString,
+					Description: "The message to send to Devin (e.g. a follow-up instruction, answer, or change request)",
+				},
+			},
+			Required: []string{"session_id", "message"},
+		},
+	},
+	"complete_session": {
+		Name: "complete_session",
+		Description: "Finalize and archive a Devin session. Call this upon mission finalization " +
+			"once no further follow-up messages are needed, to archive the session and release its " +
+			"resources. After completion the session can no longer be resumed with send_message.",
+		Schema: squadron.Schema{
+			Type: squadron.TypeObject,
+			Properties: squadron.PropertyMap{
+				"session_id": {
+					Type:        squadron.TypeString,
+					Description: "The Devin session ID to finalize and archive (e.g. 32fee96e7997499ca010301aa50eefce)",
+				},
+			},
+			Required: []string{"session_id"},
+		},
+	},
 }
 
 // Plugin implements the squadron.ToolProvider interface for Devin AI integration.
 type Plugin struct {
-	client      *devin.Client
-	pollTimeout time.Duration
+	client            *devin.Client
+	pollTimeout       time.Duration
+	archiveOnComplete bool
 }
 
 // Configure receives settings from the Squadron HCL config.
@@ -118,6 +157,10 @@ type Plugin struct {
 // Optional settings:
 //   - poll_timeout_minutes: Maximum time in minutes to wait for a Devin session
 //     to complete. Defaults to 60.
+//   - archive_on_complete: Whether the code_qa, code_review, and code_develop
+//     tools archive their session once Devin finishes. Defaults to true. Set to
+//     false to leave sessions in a resumable state so they can be continued with
+//     send_message and explicitly finalized with complete_session.
 func (p *Plugin) Configure(settings map[string]string) error {
 	apiKey, ok := settings["api_key"]
 	if !ok || apiKey == "" {
@@ -143,7 +186,26 @@ func (p *Plugin) Configure(settings map[string]string) error {
 		p.pollTimeout = time.Duration(minutes) * time.Minute
 	}
 
+	p.archiveOnComplete = true
+	if v, ok := settings["archive_on_complete"]; ok && v != "" {
+		archive, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid archive_on_complete %q: %w", v, err)
+		}
+		p.archiveOnComplete = archive
+	}
+
 	return nil
+}
+
+// finalizeSession archives a completed session unless the plugin is configured
+// to leave sessions resumable (archive_on_complete = false). When archiving is
+// skipped the session stays open so it can be continued with send_message and
+// explicitly archived later with complete_session.
+func (p *Plugin) finalizeSession(ctx context.Context, sessionID string) {
+	if p.archiveOnComplete {
+		p.client.ArchiveSession(ctx, sessionID)
+	}
 }
 
 // Call dispatches a tool invocation to the appropriate handler.
@@ -161,6 +223,10 @@ func (p *Plugin) Call(ctx context.Context, toolName string, payload string) (str
 		return p.callCodeDevelop(ctx, payload)
 	case "check_session":
 		return p.callCheckSession(ctx, payload)
+	case "send_message":
+		return p.callSendMessage(ctx, payload)
+	case "complete_session":
+		return p.callCompleteSession(ctx, payload)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", toolName)
 	}
@@ -209,6 +275,17 @@ type checkSessionParams struct {
 	SessionID string `json:"session_id"`
 }
 
+// sendMessageParams are the parameters for the send_message tool.
+type sendMessageParams struct {
+	SessionID string `json:"session_id"`
+	Message   string `json:"message"`
+}
+
+// completeSessionParams are the parameters for the complete_session tool.
+type completeSessionParams struct {
+	SessionID string `json:"session_id"`
+}
+
 // callCodeQA creates a Devin session to perform QA on a PR and polls until completion.
 func (p *Plugin) callCodeQA(ctx context.Context, payload string) (string, error) {
 	var params codeQAParams
@@ -235,7 +312,7 @@ func (p *Plugin) callCodeQA(ctx context.Context, payload string) (string, error)
 
 	messages, msgErr := p.client.GetMessages(ctx, session.SessionID)
 
-	p.client.ArchiveSession(ctx, session.SessionID)
+	p.finalizeSession(ctx, session.SessionID)
 
 	return formatQAResult(session.SessionID, session.URL, status, messages, msgErr), nil
 }
@@ -266,7 +343,7 @@ func (p *Plugin) callCodeReview(ctx context.Context, payload string) (string, er
 
 	messages, msgErr := p.client.GetMessages(ctx, session.SessionID)
 
-	p.client.ArchiveSession(ctx, session.SessionID)
+	p.finalizeSession(ctx, session.SessionID)
 
 	return formatReviewResult(session.SessionID, session.URL, status, messages, msgErr), nil
 }
@@ -301,7 +378,7 @@ func (p *Plugin) callCodeDevelop(ctx context.Context, payload string) (string, e
 
 	messages, msgErr := p.client.GetMessages(ctx, session.SessionID)
 
-	p.client.ArchiveSession(ctx, session.SessionID)
+	p.finalizeSession(ctx, session.SessionID)
 
 	return formatDevelopResult(session.SessionID, session.URL, status, messages, msgErr), nil
 }
@@ -327,6 +404,59 @@ func (p *Plugin) callCheckSession(ctx context.Context, payload string) (string, 
 	insights, _ := p.client.GetSessionInsights(ctx, params.SessionID)
 
 	return formatCheckSessionResult(params.SessionID, status, messages, msgErr, insights), nil
+}
+
+// callSendMessage sends a follow-up message to an existing session and polls
+// until Devin finishes responding, then returns Devin's updated messages.
+func (p *Plugin) callSendMessage(ctx context.Context, payload string) (string, error) {
+	var params sendMessageParams
+	if err := json.Unmarshal([]byte(payload), &params); err != nil {
+		return "", fmt.Errorf("invalid payload: %w", err)
+	}
+	if params.SessionID == "" {
+		return "", fmt.Errorf("session_id is required")
+	}
+	if params.Message == "" {
+		return "", fmt.Errorf("message is required")
+	}
+
+	if err := p.client.SendMessage(ctx, params.SessionID, params.Message); err != nil {
+		return "", fmt.Errorf("send message to session %s: %w", params.SessionID, err)
+	}
+
+	status, err := p.client.PollUntilDone(ctx, params.SessionID, 0, p.pollTimeout)
+	if err != nil {
+		return "", fmt.Errorf("waiting for devin session %s: %w", params.SessionID, err)
+	}
+
+	messages, msgErr := p.client.GetMessages(ctx, params.SessionID)
+
+	return formatSendMessageResult(params.SessionID, status, messages, msgErr), nil
+}
+
+// callCompleteSession finalizes a session by archiving it. This is the explicit
+// counterpart to leaving sessions resumable (archive_on_complete = false): once
+// the mission is finished and no further follow-ups are needed, the session is
+// archived to release its resources.
+func (p *Plugin) callCompleteSession(ctx context.Context, payload string) (string, error) {
+	var params completeSessionParams
+	if err := json.Unmarshal([]byte(payload), &params); err != nil {
+		return "", fmt.Errorf("invalid payload: %w", err)
+	}
+	if params.SessionID == "" {
+		return "", fmt.Errorf("session_id is required")
+	}
+
+	if err := p.client.ArchiveSession(ctx, params.SessionID); err != nil {
+		return "", fmt.Errorf("archive session %s: %w", params.SessionID, err)
+	}
+
+	var b strings.Builder
+	b.WriteString("=== Devin Session Finalized ===\n\n")
+	b.WriteString(fmt.Sprintf("Session: %s\n", params.SessionID))
+	b.WriteString("Status: archived\n\n")
+	b.WriteString("The session has been finalized and archived. It can no longer be resumed.\n")
+	return b.String(), nil
 }
 
 // buildQAPrompt constructs the Devin prompt for a QA review.
@@ -531,6 +661,42 @@ func formatDevelopResult(sessionID, sessionURL string, status *devin.SessionStat
 	b.WriteString("\nView the full Devin session for details: ")
 	b.WriteString(sessionURL)
 	b.WriteString("\n")
+
+	return b.String()
+}
+
+// formatSendMessageResult formats the result of a follow-up message into a readable text summary.
+func formatSendMessageResult(sessionID string, status *devin.SessionStatus, messagesJSON string, msgErr error) string {
+	var b strings.Builder
+	b.WriteString("=== Devin Follow-up Complete ===\n\n")
+	b.WriteString(fmt.Sprintf("Session: %s\n", sessionID))
+	if status.URL != "" {
+		b.WriteString(fmt.Sprintf("URL: %s\n", status.URL))
+	}
+	b.WriteString(fmt.Sprintf("Status: %s\n", status.Status))
+	if status.StatusDetail != "" {
+		b.WriteString(fmt.Sprintf("Status Detail: %s\n", status.StatusDetail))
+	}
+	b.WriteString("\n")
+
+	if status.Title != "" {
+		b.WriteString(fmt.Sprintf("Title: %s\n\n", status.Title))
+	}
+
+	if prs := formatPullRequests(status.PullRequests); prs != "" {
+		b.WriteString("Pull Requests:\n")
+		b.WriteString(prs)
+		b.WriteString("\n")
+	}
+
+	sessionURL := status.URL
+	if sessionURL == "" {
+		sessionURL = "https://app.devin.ai/sessions/" + sessionID
+	}
+	formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
+
+	b.WriteString("\nThe session is still open. Send another message to continue, ")
+	b.WriteString("or call complete_session to finalize it.\n")
 
 	return b.String()
 }

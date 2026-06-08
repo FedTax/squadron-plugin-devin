@@ -111,6 +111,49 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*
 	return &result, nil
 }
 
+// SendMessageRequest is the payload for sending a message to an existing session.
+type SendMessageRequest struct {
+	Message string `json:"message"`
+}
+
+// SendMessage posts a follow-up message to an existing Devin session via the
+// v3 organization-scoped messages endpoint:
+//
+//	POST /v3/organizations/{org_id}/sessions/{session_id}/messages
+//
+// This resumes a session that is waiting for user input and instructs Devin to
+// continue working. Poll the session afterward with PollUntilDone to wait for
+// the follow-up work to finish.
+//
+// See https://docs.devin.ai/api-reference/v3/sessions/post-organizations-session-messages
+func (c *Client) SendMessage(ctx context.Context, sessionID, message string) error {
+	body, err := json.Marshal(SendMessageRequest{Message: message})
+	if err != nil {
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	url := c.orgURL() + "/sessions/" + sessionID + "/messages"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("send request to %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("devin API error (status %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
 // GetSession retrieves the current status of a Devin session.
 func (c *Client) GetSession(ctx context.Context, sessionID string) (*SessionStatus, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.orgURL()+"/sessions/"+sessionID, nil)
