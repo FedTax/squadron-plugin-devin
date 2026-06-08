@@ -78,6 +78,33 @@ The session ID is returned by `code_qa`, `code_review`, and `code_develop` when 
 |------|------|----------|-------------|
 | `session_id` | string | yes | The Devin session ID (e.g. `32fee96e7997499ca010301aa50eefce`) |
 
+### `send_message`
+
+Sends a follow-up message to an existing Devin session and waits for Devin to finish responding. Use this to continue a conversation with a session that is waiting for user input, for example to answer a question, give additional instructions, or request changes.
+
+The session must still be open (not archived). To keep sessions resumable after `code_qa`, `code_review`, or `code_develop` complete, set `archive_on_complete = "false"` in the plugin settings.
+
+After sending the message, the plugin reuses the same polling logic as the other tools, waiting until Devin finishes the follow-up work before returning its response.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `session_id` | string | yes | The Devin session ID to send the message to |
+| `message` | string | yes | The message to send to Devin (follow-up instruction, answer, or change request) |
+
+### `complete_session`
+
+Finalizes and archives a Devin session. Call this upon mission finalization once no further follow-up messages are needed, to archive the session and release its resources. After completion the session can no longer be resumed with `send_message`.
+
+This is the explicit counterpart to `archive_on_complete = "false"`: when sessions are left resumable, use `complete_session` to archive them when the work is truly done.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `session_id` | string | yes | The Devin session ID to finalize and archive |
+
 ## Prerequisites
 
 - Go 1.23+
@@ -130,6 +157,7 @@ plugin "devin" {
     api_key              = "<your-devin-service-user-key>"
     org_id               = "<your-devin-org-id>"
     poll_timeout_minutes = "60"
+    archive_on_complete  = "true"
   }
 }
 ```
@@ -139,7 +167,7 @@ Then attach the tools to an agent:
 ```hcl
 agent "reviewer" {
   model = models.anthropic.claude_sonnet_4
-  tools = [plugins.devin.code_qa, plugins.devin.code_review, plugins.devin.code_develop, plugins.devin.check_session]
+  tools = [plugins.devin.code_qa, plugins.devin.code_review, plugins.devin.code_develop, plugins.devin.check_session, plugins.devin.send_message, plugins.devin.complete_session]
 }
 ```
 
@@ -150,13 +178,16 @@ agent "reviewer" {
 | `api_key` | yes | Devin service user API key (starts with `cog_`). Created under **Settings > Service Users** in the Devin dashboard. |
 | `org_id` | yes | Devin organization ID. Found on the **Settings > Service Users** page in the Devin dashboard. |
 | `poll_timeout_minutes` | no | Maximum time in minutes to wait for a Devin session to complete. Defaults to `60`. Increase for long-running development tasks. |
+| `archive_on_complete` | no | Whether `code_qa`, `code_review`, and `code_develop` archive their session once Devin finishes. Defaults to `true`. Set to `false` to leave sessions resumable so they can be continued with `send_message` and finalized with `complete_session`. |
 
 ## How It Works
 
 1. The agent invokes a tool (`code_qa`, `code_review`, or `code_develop`) with the required parameters.
 2. The plugin creates a new Devin session via the [Devin v3 API](https://docs.devin.ai/api-reference/overview) (`POST /v3/organizations/{org_id}/sessions`).
 3. The plugin polls the session status every 15 seconds (up to `poll_timeout_minutes`, default 60) until Devin finishes.
-4. The session is archived and the result — including Devin's messages — is returned as a text summary.
+4. The session is archived (unless `archive_on_complete = "false"`) and the result — including Devin's messages — is returned as a text summary.
+
+When `archive_on_complete` is `false`, sessions are left open after they finish. Use `send_message` to continue working with a session (the plugin sends the message and polls until Devin finishes again), and `complete_session` to archive it once the mission is finalized.
 
 For `code_review`, Devin also posts inline review comments directly on the GitHub PR during its session.
 

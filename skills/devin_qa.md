@@ -31,7 +31,9 @@ Use `code_qa` to have Devin perform a full QA review of a pull request. Devin ch
 }
 ```
 
-The response includes the session ID, status, and Devin's QA findings. The session is archived automatically after completion.
+The response includes the session ID, status, and Devin's QA findings.
+
+By default the session is archived automatically after completion. If the plugin is configured with `archive_on_complete = "false"`, the session is left open and resumable instead — continue it with `send_message` and finalize it with `complete_session` (see below).
 
 ### 2. Retrieve Results with `check_session`
 
@@ -43,7 +45,36 @@ If the QA response is missing Devin's findings, use `check_session` with the ses
 }
 ```
 
-### 3. Interpreting the QA Response
+### 3. Follow Up with `send_message`
+
+If you need Devin to dig deeper or re-check something after its QA pass, use `send_message` to send a follow-up and wait for the response. The session must still be open, which requires `archive_on_complete = "false"` in the plugin settings.
+
+**Required parameters:**
+- `session_id` — the session to continue
+- `message` — the follow-up instruction or question
+
+```json
+{
+  "session_id": "32fee96e7997499ca010301aa50eefce",
+  "message": "Re-run the integration tests and confirm the refund edge case is covered."
+}
+```
+
+The plugin sends the message and polls until Devin finishes, then returns its updated findings. Call it as many times as needed.
+
+### 4. Finalize with `complete_session`
+
+When the QA work is finished and no further follow-ups are needed, call `complete_session` to archive the session and release its resources. After this the session can no longer be resumed.
+
+```json
+{
+  "session_id": "32fee96e7997499ca010301aa50eefce"
+}
+```
+
+This is the explicit counterpart to `archive_on_complete = "false"`.
+
+### 5. Interpreting the QA Response
 
 **Devin's Response section** — contains Devin's QA summary with categorized findings (critical issues, warnings, suggestions, and things that look good).
 

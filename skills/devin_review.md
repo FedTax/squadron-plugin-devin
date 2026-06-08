@@ -29,7 +29,9 @@ Use `code_review` to have Devin review a pull request. Devin reviews every chang
 }
 ```
 
-The response includes the session ID, status, pull request links, and Devin's review summary. Inline comments are posted directly on the GitHub PR. The session is archived automatically after completion.
+The response includes the session ID, status, pull request links, and Devin's review summary. Inline comments are posted directly on the GitHub PR.
+
+By default the session is archived automatically after completion. If the plugin is configured with `archive_on_complete = "false"`, the session is left open and resumable instead — continue it with `send_message` and finalize it with `complete_session` (see below).
 
 ### 2. Retrieve Results with `check_session`
 
@@ -41,7 +43,36 @@ If the review response is missing Devin's summary, use `check_session` with the 
 }
 ```
 
-### 3. Interpreting the Review Response
+### 3. Follow Up with `send_message`
+
+If you want Devin to re-review after changes or address a specific concern, use `send_message` to send a follow-up and wait for the response. The session must still be open, which requires `archive_on_complete = "false"` in the plugin settings.
+
+**Required parameters:**
+- `session_id` — the session to continue
+- `message` — the follow-up instruction or question
+
+```json
+{
+  "session_id": "32fee96e7997499ca010301aa50eefce",
+  "message": "The author pushed a fix for the SQL injection comment — please re-review the updated query builder."
+}
+```
+
+The plugin sends the message and polls until Devin finishes, then returns its updated summary (and Devin may post new inline comments on the PR). Call it as many times as needed.
+
+### 4. Finalize with `complete_session`
+
+When the review is complete and no further follow-ups are needed, call `complete_session` to archive the session and release its resources. After this the session can no longer be resumed.
+
+```json
+{
+  "session_id": "32fee96e7997499ca010301aa50eefce"
+}
+```
+
+This is the explicit counterpart to `archive_on_complete = "false"`.
+
+### 5. Interpreting the Review Response
 
 **Devin's Response section** — contains Devin's overall review summary describing what was found across the PR.
 
