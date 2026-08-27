@@ -15,6 +15,16 @@ Use `code_develop` to assign a development task to Devin. Devin clones the repo,
 **Optional parameters:**
 - `branch` — branch name for Devin to create (Devin picks one if omitted)
 - `instructions` — additional context, constraints, or coding guidelines
+- `title` — session title, e.g. `"DEV-8126 investigate"` (Devin generates one if omitted)
+- `tags` — session tags, e.g. `["ratevariant", "investigate"]`, so the sessions a mission spawned can be found later
+- `prompt_mode` — `"default"` or `"raw"`
+
+**`prompt_mode`:** the default wraps your task in a fixed workflow — create a branch, implement,
+add tests, commit, open a PR. That is wrong for two common jobs: a **read-only investigation**
+(which must not branch or open a PR) and a **follow-on stage** that has to push to a branch and
+PR that already exist. For those, pass `"prompt_mode": "raw"`; your `task` and `instructions`
+then reach Devin verbatim, so they must carry every instruction the job needs, including what
+not to do.
 
 **Tips for effective prompts:**
 - Be specific about what to change and where in the codebase
@@ -32,7 +42,10 @@ Use `code_develop` to assign a development task to Devin. Devin clones the repo,
 }
 ```
 
-The response includes the session ID, status, any pull request links, and Devin's messages describing what was done.
+The response includes the session ID, status, any pull request links, the session's structured
+output (if its playbook defines a schema), and Devin's final message. The full transcript is not
+returned — follow the session URL for it, or set `raw_messages = "true"` in the plugin settings
+if an agent genuinely needs the whole conversation.
 
 By default the session is archived automatically after completion. If the plugin is configured with `archive_on_complete = "false"`, the session is left open and resumable instead — continue it with `send_message` and finalize it with `complete_session` (see below).
 

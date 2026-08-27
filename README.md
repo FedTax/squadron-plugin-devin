@@ -25,6 +25,8 @@ The QA review covers:
 |------|------|----------|-------------|
 | `pr_url` | string | yes | Full URL of the GitHub PR (e.g. `https://github.com/org/repo/pull/123`) |
 | `instructions` | string | no | Additional instructions or focus areas for the QA review |
+| `title` | string | no | Title for the Devin session. Devin generates one if omitted. |
+| `tags` | string[] | no | Tags to apply to the Devin session, for filtering sessions later |
 
 ### `code_review`
 
@@ -44,6 +46,8 @@ The code review covers:
 |------|------|----------|-------------|
 | `pr_url` | string | yes | Full URL of the GitHub PR (e.g. `https://github.com/org/repo/pull/123`) |
 | `instructions` | string | no | Additional instructions or focus areas for the code review |
+| `title` | string | no | Title for the Devin session. Devin generates one if omitted. |
+| `tags` | string[] | no | Tags to apply to the Devin session, for filtering sessions later |
 
 ### `code_develop`
 
@@ -65,6 +69,14 @@ Devin will follow existing code conventions, add or update tests, and open a PR 
 | `task` | string | yes | Description of the development task to perform |
 | `branch` | string | no | Branch name for Devin to create. If omitted, Devin chooses an appropriate name. |
 | `instructions` | string | no | Additional context, constraints, or coding guidelines |
+| `title` | string | no | Title for the Devin session (e.g. `DEV-8126 investigate`). Devin generates one if omitted. |
+| `tags` | string[] | no | Tags to apply to the Devin session (e.g. `["ratevariant", "investigate"]`), for filtering sessions later |
+| `prompt_mode` | string | no | `default` (default) wraps the task in the branch / tests / commit / PR workflow above. `raw` sends `task` and `instructions` verbatim with no added steps. |
+
+Use `prompt_mode = "raw"` when the default workflow is wrong for the job: a read-only
+investigation that must not create a branch or PR, or a later stage that must push to a branch
+and PR that already exist. In `raw` mode the task text is the whole prompt, so it has to carry
+its own instructions.
 
 ### `check_session`
 
@@ -179,6 +191,7 @@ agent "reviewer" {
 | `org_id` | yes | Devin organization ID. Found on the **Settings > Service Users** page in the Devin dashboard. |
 | `poll_timeout_minutes` | no | Maximum time in minutes to wait for a Devin session to complete. Defaults to `60`. Increase for long-running development tasks. |
 | `archive_on_complete` | no | Whether `code_qa`, `code_review`, and `code_develop` archive their session once Devin finishes. Defaults to `true`. Set to `false` to leave sessions resumable so they can be continued with `send_message` and finalized with `complete_session`. |
+| `raw_messages` | no | Whether tool results carry the session's entire messages JSON payload. Defaults to `false`: results carry Devin's final message, the session's structured output, and PR links. Set to `true` for the full transcript, which is large enough to crowd out the rest of the caller's context. |
 
 ## How It Works
 
