@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FedTax/squadron-plugin-devin/devin"
 	squadron "github.com/mlund01/squadron-sdk"
-	"github.com/ericlakich/squadron-plugin-devin/devin"
 )
 
 // tools defines the metadata for all tools provided by this plugin.

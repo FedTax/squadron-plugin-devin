@@ -1,4 +1,4 @@
-module github.com/ericlakich/squadron-plugin-devin
+module github.com/FedTax/squadron-plugin-devin
 
 go 1.23.0
 
