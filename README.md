@@ -25,7 +25,8 @@ session_id ─────────────────────> send
 ```
 
 `check_session` is the read-only view of any session by ID — use it to inspect a session another
-stage created, or one whose result you no longer have.
+stage created, or one whose result you no longer have. `find_sessions` is how you get that ID
+without being told it: search by the ticket tag the earlier stage created its session with.
 
 ### What a tool result contains
 
@@ -75,6 +76,12 @@ Everything goes through five organization-scoped v3 endpoints on `https://api.de
 | `GetMessages` | `GET .../sessions/{id}/messages` | the transcript, returned as raw JSON |
 | `GetSessionInsights` | `GET .../sessions/insights?session_ids={id}` | `structured_output` plus Devin's analysis (issues, action items, timeline) |
 | `SendMessage` / `ArchiveSession` | `POST .../messages`, `POST .../archive` | resume, and finalize |
+
+`find_sessions` is the one exception to "everything is v3": it calls
+`GET https://api.devin.ai/v1/sessions?tags=<tag>&tags=<tag>&limit=<n>`, because v1 is where tag
+filtering is documented, while the v3 list endpoint takes an undocumented `qs` object. Same bearer
+key; the organization is implied by the key rather than being in the path. The list response is a
+summary — no structured output — so `check_session` is still what fetches a session's detail.
 
 **Polling.** `PollUntilDone` ticks every 15s until a terminal state, and tolerates 5 *consecutive*
 transient `GetSession` failures before giving up (the counter resets on any success), so a brief
@@ -210,6 +217,28 @@ After sending the message, the plugin reuses the same polling logic as the other
 | `session_id` | string | yes | The Devin session ID to send the message to |
 | `message` | string | yes | The message to send to Devin (follow-up instruction, answer, or change request) |
 
+### `find_sessions`
+
+Finds existing sessions by tag. This is how a mission discovers what an earlier run already did
+for a ticket without a human passing session IDs in: every session-creating tool takes `tags`, so
+tagging sessions with the ticket key (`["DEV-8126", "rate-investigation"]`) makes them findable
+later by that key. A session must carry **all** the given tags to match, and matching is exact.
+
+The result is one block per session — ID, status, title, PR link, timestamps, tags, session URL —
+intended for choosing which session to act on, not for reading its work: follow up with
+`check_session` for detail (structured output, transcript) or `send_message` to continue it. No
+match is a normal answer, reported as `Matches: 0`.
+
+Unlike the other tools this one is a single API call and returns immediately — it creates nothing
+and does not poll.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `tags` | string[] | yes | Tags a session must all carry to match |
+| `limit` | number | no | Maximum sessions to return. Defaults to 20. |
+
 ### `complete_session`
 
 Finalizes and archives a Devin session. Call this upon mission finalization once no further follow-up messages are needed, to archive the session and release its resources. After completion the session can no longer be resumed with `send_message`.
@@ -289,7 +318,7 @@ Then attach the tools to an agent:
 ```hcl
 agent "reviewer" {
   model = models.anthropic.claude_sonnet_4
-  tools = [plugins.devin.code_qa, plugins.devin.code_review, plugins.devin.code_develop, plugins.devin.check_session, plugins.devin.send_message, plugins.devin.complete_session]
+  tools = [plugins.devin.code_qa, plugins.devin.code_review, plugins.devin.code_develop, plugins.devin.find_sessions, plugins.devin.check_session, plugins.devin.send_message, plugins.devin.complete_session]
 }
 ```
 

@@ -8,11 +8,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 )
 
 const (
 	baseURL = "https://api.devin.ai/v3"
+
+	// v1BaseURL serves the session list endpoint, which is the only documented
+	// way to filter sessions by tag.
+	v1BaseURL = "https://api.devin.ai/v1"
+
+	// defaultListLimit caps a tag search that does not ask for a size.
+	defaultListLimit = 20
 
 	// Polling configuration
 	defaultPollInterval = 15 * time.Second
@@ -77,7 +86,6 @@ type PullRequest struct {
 	URL   string `json:"pr_url"`
 	State string `json:"pr_state"`
 }
-
 
 // CreateSession creates a new Devin session with the given prompt.
 func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (*CreateSessionResponse, error) {
@@ -222,24 +230,24 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) (string, err
 // SessionInsight contains enriched session data from the insights endpoint,
 // including analysis with action items, issues, timeline, and classification.
 type SessionInsight struct {
-	SessionID        string            `json:"session_id"`
-	Status           string            `json:"status"`
-	StatusDetail     string            `json:"status_detail"`
-	Title            string            `json:"title"`
-	URL              string            `json:"url"`
-	PullRequests     []PullRequest     `json:"pull_requests,omitempty"`
-	IsArchived       bool              `json:"is_archived"`
-	ACUsConsumed     float64           `json:"acus_consumed"`
-	StructuredOutput json.RawMessage   `json:"structured_output,omitempty"`
-	Analysis         *SessionAnalysis  `json:"analysis,omitempty"`
+	SessionID        string           `json:"session_id"`
+	Status           string           `json:"status"`
+	StatusDetail     string           `json:"status_detail"`
+	Title            string           `json:"title"`
+	URL              string           `json:"url"`
+	PullRequests     []PullRequest    `json:"pull_requests,omitempty"`
+	IsArchived       bool             `json:"is_archived"`
+	ACUsConsumed     float64          `json:"acus_consumed"`
+	StructuredOutput json.RawMessage  `json:"structured_output,omitempty"`
+	Analysis         *SessionAnalysis `json:"analysis,omitempty"`
 }
 
 // SessionAnalysis contains the AI-generated analysis of a session.
 type SessionAnalysis struct {
-	ActionItems    []string                `json:"action_items,omitempty"`
-	Issues         []string                `json:"issues,omitempty"`
-	Timeline       []string                `json:"timeline,omitempty"`
-	Classification *SessionClassification  `json:"classification,omitempty"`
+	ActionItems    []string               `json:"action_items,omitempty"`
+	Issues         []string               `json:"issues,omitempty"`
+	Timeline       []string               `json:"timeline,omitempty"`
+	Classification *SessionClassification `json:"classification,omitempty"`
 }
 
 // SessionClassification describes the category and technologies of a session.
@@ -312,6 +320,81 @@ func (c *Client) ArchiveSession(ctx context.Context, sessionID string) error {
 	}
 
 	return nil
+}
+
+// SessionSummary is one entry from a session list response. It is deliberately
+// thinner than SessionStatus: a list call is for finding the session you want,
+// after which GetSession/GetMessages fetch its detail.
+type SessionSummary struct {
+	SessionID   string   `json:"session_id"`
+	Status      string   `json:"status"`
+	StatusEnum  string   `json:"status_enum"`
+	Title       string   `json:"title"`
+	Tags        []string `json:"tags"`
+	CreatedAt   string   `json:"created_at"`
+	UpdatedAt   string   `json:"updated_at"`
+	PullRequest *struct {
+		URL string `json:"url"`
+	} `json:"pull_request"`
+}
+
+// listSessionsQuery builds the query string for a tag search. Each tag is a
+// repeated `tags` parameter, which is how the endpoint expresses a list.
+func listSessionsQuery(tags []string, limit int) url.Values {
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	query := url.Values{}
+	for _, tag := range tags {
+		query.Add("tags", tag)
+	}
+	query.Set("limit", strconv.Itoa(limit))
+	return query
+}
+
+// listSessionsResponse is the envelope returned by the v1 list endpoint.
+type listSessionsResponse struct {
+	Sessions []SessionSummary `json:"sessions"`
+}
+
+// ListSessionsByTags returns the organization's sessions carrying ALL of the
+// given tags, most useful for finding the sessions an earlier mission run
+// created for a ticket.
+//
+//	GET /v1/sessions?tags=<tag>&tags=<tag>&limit=<n>
+//
+// This is the v1 endpoint, not v3: v1 documents tag filtering directly, while
+// the v3 list endpoint takes an undocumented `qs` query-params object. The
+// organization is the one the API key belongs to, so orgID is not in the path.
+//
+// See https://docs.devin.ai/api-reference/v1/sessions/list-sessions
+func (c *Client) ListSessionsByTags(ctx context.Context, tags []string, limit int) ([]SessionSummary, error) {
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("at least one tag is required")
+	}
+	endpoint := v1BaseURL + "/sessions?" + listSessionsQuery(tags, limit).Encode()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("devin API error (status %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var result listSessionsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return result.Sessions, nil
 }
 
 // PollUntilDone polls the session status until it reaches a terminal state

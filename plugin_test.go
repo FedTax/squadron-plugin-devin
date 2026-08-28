@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/FedTax/squadron-plugin-devin/devin"
 )
 
 func TestBuildDevelopPromptRawOmitsWorkflow(t *testing.T) {
@@ -79,5 +81,47 @@ func TestLastDevinMessage(t *testing.T) {
 				t.Errorf("message = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestFormatFindSessionsResultEmpty(t *testing.T) {
+	out := formatFindSessionsResult([]string{"DEV-8126"}, nil)
+
+	if !strings.Contains(out, "Matches: 0") {
+		t.Errorf("empty result should report the count:\n%s", out)
+	}
+	if !strings.Contains(out, "No session carries all of those tags") {
+		t.Errorf("empty result should say so explicitly:\n%s", out)
+	}
+}
+
+func TestFormatFindSessionsResultListsSessions(t *testing.T) {
+	sessions := []devin.SessionSummary{
+		{
+			SessionID:  "devin-abc",
+			Status:     "exit",
+			StatusEnum: "finished",
+			Title:      "DEV-8126 investigate",
+			Tags:       []string{"DEV-8126", "rate-investigation"},
+			CreatedAt:  "2026-08-20T10:00:00Z",
+			PullRequest: &struct {
+				URL string `json:"url"`
+			}{URL: "https://github.com/FedTax/txc-sqlserver-database/pull/201"},
+		},
+		{SessionID: "devin-def", Status: "running"},
+	}
+
+	out := formatFindSessionsResult([]string{"DEV-8126"}, sessions)
+
+	for _, want := range []string{
+		"Matches: 2",
+		"devin-abc — exit (finished)",
+		"DEV-8126 investigate",
+		"pull/201",
+		"devin-def — running",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("result missing %q:\n%s", want, out)
+		}
 	}
 }
