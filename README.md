@@ -4,6 +4,111 @@ A [Squadron](https://github.com/mlund01/squadron-sdk) plugin that integrates [De
 
 This plugin uses the [Devin v3 API](https://docs.devin.ai/api-reference/overview).
 
+## How a mission uses this plugin
+
+Every session-creating tool (`code_qa`, `code_review`, `code_develop`) is **synchronous**: it
+creates the session, polls until Devin finishes, and returns one text result. So a mission stage
+that calls `code_develop` blocks for the length of the Devin session — set
+`poll_timeout_minutes` to cover the longest task you expect (a multi-hour development session
+needs far more than the 60-minute default).
+
+```
+code_develop ──create──> Devin session ──poll every 15s──> done
+     │                                                       │
+     │                                     archive_on_complete = true  → archived, terminal
+     │                                     archive_on_complete = false → left open
+     ▼                                                       ▼
+session_id ─────────────────────> send_message (iterate, blocks again)
+                                            │
+                                            ▼
+                                   complete_session (archive)
+```
+
+`check_session` is the read-only view of any session by ID — use it to inspect a session another
+stage created, or one whose result you no longer have.
+
+### What a tool result contains
+
+Every result is plain text with these sections, in order:
+
+```
+=== Devin Development Complete ===
+Session: <id>          URL: <session url>          Status: <status>
+Pull Requests:         <pr url> (<state>)
+--- Structured Output ---   the session's structured_output JSON, verbatim
+--- Devin's Response ---    Devin's final message, plus a link to the full transcript
+```
+
+The `Structured Output` and `Pull Requests` sections are omitted when the session has neither.
+
+### Structured output
+
+This is the part a mission should **route on**; the prose response is for humans reading the run.
+
+It comes from Devin, not from this plugin: when a session runs a playbook that defines a
+`structured_output_schema`, Devin populates `structured_output` on the session, and the plugin
+reads it back from `GET /v3/organizations/{org_id}/sessions/insights` and prints it verbatim in
+every result (not just `check_session`). A mission then parses those fields for its router
+conditions, e.g.:
+
+```hcl
+# the investigation playbook's schema emits { "verdict": "...", "evidence_complete": true }
+router {
+  condition = "verdict == 'DEFECT_PROVEN'"
+  send_to   = task.develop
+}
+```
+
+If a session has no playbook schema, `structured_output` is empty and the section is absent — the
+stage has to fall back to reading Devin's final message, which is exactly the ambiguity the
+schemas exist to remove.
+
+### Devin API surface
+
+Everything goes through five organization-scoped v3 endpoints on `https://api.devin.ai/v3`
+(`devin/client.go`), authenticated with `Authorization: Bearer <api_key>`:
+
+| Call | Endpoint | Used for |
+|---|---|---|
+| `CreateSession` | `POST /organizations/{org}/sessions` | `{prompt, repos, title, tags}`. `repos` is how `code_develop` grants repo access; `title`/`tags` are metadata only and never reach the prompt. |
+| `GetSession` | `GET .../sessions/{id}` | poll target: `status`, `status_detail`, `pull_requests` |
+| `GetMessages` | `GET .../sessions/{id}/messages` | the transcript, returned as raw JSON |
+| `GetSessionInsights` | `GET .../sessions/insights?session_ids={id}` | `structured_output` plus Devin's analysis (issues, action items, timeline) |
+| `SendMessage` / `ArchiveSession` | `POST .../messages`, `POST .../archive` | resume, and finalize |
+
+**Polling.** `PollUntilDone` ticks every 15s until a terminal state, and tolerates 5 *consecutive*
+transient `GetSession` failures before giving up (the counter resets on any success), so a brief
+API blip doesn't kill a long session. Terminal means either `status` in
+`exit | error | suspended | sleeping | waiting_for_user`, **or** `status_detail` in
+`waiting_for_user | finished` while `status` is still `running` — that second case is the normal
+end of a successful session, since Devin stays running and awaits follow-up. Hitting
+`poll_timeout_minutes` is an error, not a result: the session keeps going on Devin's side, so
+recover it with `check_session` rather than re-running the stage.
+
+A tool result is assembled from those calls in order — header and `Pull Requests` from
+`GetSession`, `Structured Output` from `GetSessionInsights`, `Devin's Response` from
+`GetMessages`. Failures downgrade rather than abort: a failed `GetMessages` prints the error plus
+the session URL, and absent insights simply omit their section, so a stage still gets the session
+ID and PR links.
+
+**Message extraction.** The messages payload is not a stable shape, so `lastDevinMessage` is
+deliberately forgiving: it accepts either a bare array or `{"messages": [...]}`, walks **backwards**
+to the last Devin-authored entry (a session ends with Devin's summary unless it stopped to ask a
+question, in which case that question is what you want), sniffs authorship across
+`type`/`origin`/`role`/`source`/`author`, and reads the body from whichever of
+`message`/`text`/`content`/`body` is populated. Any entry with no recognizable authorship field is
+treated as Devin's, and an unparseable payload falls back to printing the raw JSON — both
+biased toward showing you something over silently dropping what Devin said.
+
+### Prompt modes
+
+`code_develop` builds the prompt for you. In `default` mode it appends a fixed workflow — create a
+branch, implement, add tests, commit, open a PR — which is right for ordinary development and
+wrong for two common stages: a **read-only investigation** (must not branch or open a PR) and a
+**follow-on stage** that must push to a branch and PR that already exist. `prompt_mode = "raw"`
+sends `task` (and `branch`/`instructions`, if given) verbatim, so the task text has to carry every
+instruction the job needs — including what *not* to do.
+
 ## Tools
 
 ### `code_qa`
@@ -25,6 +130,8 @@ The QA review covers:
 |------|------|----------|-------------|
 | `pr_url` | string | yes | Full URL of the GitHub PR (e.g. `https://github.com/org/repo/pull/123`) |
 | `instructions` | string | no | Additional instructions or focus areas for the QA review |
+| `title` | string | no | Title for the Devin session. Devin generates one if omitted. |
+| `tags` | string[] | no | Tags to apply to the Devin session, for filtering sessions later |
 
 ### `code_review`
 
@@ -44,6 +151,8 @@ The code review covers:
 |------|------|----------|-------------|
 | `pr_url` | string | yes | Full URL of the GitHub PR (e.g. `https://github.com/org/repo/pull/123`) |
 | `instructions` | string | no | Additional instructions or focus areas for the code review |
+| `title` | string | no | Title for the Devin session. Devin generates one if omitted. |
+| `tags` | string[] | no | Tags to apply to the Devin session, for filtering sessions later |
 
 ### `code_develop`
 
@@ -65,6 +174,14 @@ Devin will follow existing code conventions, add or update tests, and open a PR 
 | `task` | string | yes | Description of the development task to perform |
 | `branch` | string | no | Branch name for Devin to create. If omitted, Devin chooses an appropriate name. |
 | `instructions` | string | no | Additional context, constraints, or coding guidelines |
+| `title` | string | no | Title for the Devin session (e.g. `DEV-8126 investigate`). Devin generates one if omitted. |
+| `tags` | string[] | no | Tags to apply to the Devin session (e.g. `["ratevariant", "investigate"]`), for filtering sessions later |
+| `prompt_mode` | string | no | `default` (default) wraps the task in the branch / tests / commit / PR workflow above. `raw` sends `task` and `instructions` verbatim with no added steps. |
+
+Use `prompt_mode = "raw"` when the default workflow is wrong for the job: a read-only
+investigation that must not create a branch or PR, or a later stage that must push to a branch
+and PR that already exist. In `raw` mode the task text is the whole prompt, so it has to carry
+its own instructions.
 
 ### `check_session`
 
@@ -134,7 +251,7 @@ For more details, see the [Devin API documentation](https://docs.devin.ai/api-re
 
 ```bash
 # Clone the plugin project
-git clone git@github.com:ericlakich/squadron-plugin-devin.git
+git clone git@github.com:FedTax/squadron-plugin-devin.git
 
 # Build
 cd squadron-plugin-devin
@@ -152,6 +269,11 @@ Add the plugin to your Squadron HCL config:
 
 ```hcl
 plugin "devin" {
+  # A released version resolves to a git tag in the repo named by `source`:
+  #   source  = "github.com/FedTax/squadron-plugin-devin"
+  #   version = "v0.0.4"
+  # `version = "local"` instead uses the binary installed under
+  # ~/.squadron/plugins/devin/local (see Build above).
   version = "local"
   settings = {
     api_key              = "<your-devin-service-user-key>"
@@ -179,13 +301,14 @@ agent "reviewer" {
 | `org_id` | yes | Devin organization ID. Found on the **Settings > Service Users** page in the Devin dashboard. |
 | `poll_timeout_minutes` | no | Maximum time in minutes to wait for a Devin session to complete. Defaults to `60`. Increase for long-running development tasks. |
 | `archive_on_complete` | no | Whether `code_qa`, `code_review`, and `code_develop` archive their session once Devin finishes. Defaults to `true`. Set to `false` to leave sessions resumable so they can be continued with `send_message` and finalized with `complete_session`. |
+| `raw_messages` | no | Whether tool results carry the session's entire messages JSON payload. Defaults to `false`: results carry Devin's final message, the session's structured output, and PR links. Set to `true` for the full transcript, which is large enough to crowd out the rest of the caller's context. |
 
 ## How It Works
 
 1. The agent invokes a tool (`code_qa`, `code_review`, or `code_develop`) with the required parameters.
 2. The plugin creates a new Devin session via the [Devin v3 API](https://docs.devin.ai/api-reference/overview) (`POST /v3/organizations/{org_id}/sessions`).
 3. The plugin polls the session status every 15 seconds (up to `poll_timeout_minutes`, default 60) until Devin finishes.
-4. The session is archived (unless `archive_on_complete = "false"`) and the result — including Devin's messages — is returned as a text summary.
+4. The session is archived (unless `archive_on_complete = "false"`) and the result is returned as the text summary described in [What a tool result contains](#what-a-tool-result-contains).
 
 When `archive_on_complete` is `false`, sessions are left open after they finish. Use `send_message` to continue working with a session (the plugin sends the message and polls until Devin finishes again), and `complete_session` to archive it once the mission is finalized.
 

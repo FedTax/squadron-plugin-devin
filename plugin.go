@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FedTax/squadron-plugin-devin/devin"
 	squadron "github.com/mlund01/squadron-sdk"
-	"github.com/ericlakich/squadron-plugin-devin/devin"
 )
 
 // tools defines the metadata for all tools provided by this plugin.
@@ -31,6 +31,8 @@ var tools = map[string]*squadron.ToolInfo{
 					Type:        squadron.TypeString,
 					Description: "Optional additional instructions or focus areas for the QA review",
 				},
+				"title": titleProperty,
+				"tags":  tagsProperty,
 			},
 			Required: []string{"pr_url"},
 		},
@@ -52,6 +54,8 @@ var tools = map[string]*squadron.ToolInfo{
 					Type:        squadron.TypeString,
 					Description: "Optional additional instructions or focus areas for the code review",
 				},
+				"title": titleProperty,
+				"tags":  tagsProperty,
 			},
 			Required: []string{"pr_url"},
 		},
@@ -80,6 +84,16 @@ var tools = map[string]*squadron.ToolInfo{
 				"instructions": {
 					Type:        squadron.TypeString,
 					Description: "Optional additional context, constraints, or coding guidelines for the task",
+				},
+				"title": titleProperty,
+				"tags":  tagsProperty,
+				"prompt_mode": {
+					Type: squadron.TypeString,
+					Description: "How to build the session prompt. \"default\" (the default) wraps the task in the " +
+						"standard development workflow: create a branch, add tests, commit, open a PR. " +
+						"\"raw\" sends task and instructions verbatim with no added steps — use it when those " +
+						"steps would be wrong, e.g. a read-only investigation, or work that must continue on an " +
+						"existing branch and PR.",
 				},
 			},
 			Required: []string{"repo_url", "task"},
@@ -142,11 +156,30 @@ var tools = map[string]*squadron.ToolInfo{
 	},
 }
 
+// titleProperty and tagsProperty are shared by every tool that creates a Devin
+// session, so sessions can be found and grouped in the Devin UI by the mission
+// or stage that created them.
+var (
+	titleProperty = squadron.Property{
+		Type:        squadron.TypeString,
+		Description: "Optional title for the Devin session (e.g. \"DEV-8126 investigate\"). Devin generates one if omitted.",
+	}
+
+	tagsProperty = squadron.Property{
+		Type:        squadron.TypeArray,
+		Description: "Optional tags to apply to the Devin session (e.g. [\"ratevariant\", \"investigate\", \"DEV-8126\"]), for filtering sessions later.",
+		Items: &squadron.Property{
+			Type: squadron.TypeString,
+		},
+	}
+)
+
 // Plugin implements the squadron.ToolProvider interface for Devin AI integration.
 type Plugin struct {
 	client            *devin.Client
 	pollTimeout       time.Duration
 	archiveOnComplete bool
+	rawMessages       bool
 }
 
 // Configure receives settings from the Squadron HCL config.
@@ -161,6 +194,11 @@ type Plugin struct {
 //     tools archive their session once Devin finishes. Defaults to true. Set to
 //     false to leave sessions in a resumable state so they can be continued with
 //     send_message and explicitly finalized with complete_session.
+//   - raw_messages: Whether tool results carry the session's entire messages
+//     JSON payload. Defaults to false, in which case results carry Devin's final
+//     message, its structured output, and PR links — the parts a caller acts on.
+//     Set to true to get the full transcript back (large: it can dominate the
+//     caller's context window).
 func (p *Plugin) Configure(settings map[string]string) error {
 	apiKey, ok := settings["api_key"]
 	if !ok || apiKey == "" {
@@ -193,6 +231,15 @@ func (p *Plugin) Configure(settings map[string]string) error {
 			return fmt.Errorf("invalid archive_on_complete %q: %w", v, err)
 		}
 		p.archiveOnComplete = archive
+	}
+
+	p.rawMessages = false
+	if v, ok := settings["raw_messages"]; ok && v != "" {
+		raw, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid raw_messages %q: %w", v, err)
+		}
+		p.rawMessages = raw
 	}
 
 	return nil
@@ -252,23 +299,34 @@ func (p *Plugin) ListTools() ([]*squadron.ToolInfo, error) {
 
 // codeQAParams are the parameters for the code_qa tool.
 type codeQAParams struct {
-	PRURL        string `json:"pr_url"`
-	Instructions string `json:"instructions,omitempty"`
+	PRURL        string   `json:"pr_url"`
+	Instructions string   `json:"instructions,omitempty"`
+	Title        string   `json:"title,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
 }
 
 // codeReviewParams are the parameters for the code_review tool.
 type codeReviewParams struct {
-	PRURL        string `json:"pr_url"`
-	Instructions string `json:"instructions,omitempty"`
+	PRURL        string   `json:"pr_url"`
+	Instructions string   `json:"instructions,omitempty"`
+	Title        string   `json:"title,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
 }
 
 // codeDevelopParams are the parameters for the code_develop tool.
 type codeDevelopParams struct {
-	RepoURL      string `json:"repo_url"`
-	Task         string `json:"task"`
-	Branch       string `json:"branch,omitempty"`
-	Instructions string `json:"instructions,omitempty"`
+	RepoURL      string   `json:"repo_url"`
+	Task         string   `json:"task"`
+	Branch       string   `json:"branch,omitempty"`
+	Instructions string   `json:"instructions,omitempty"`
+	Title        string   `json:"title,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	PromptMode   string   `json:"prompt_mode,omitempty"`
 }
+
+// promptModeRaw sends the caller's task and instructions to Devin verbatim,
+// without the branch/tests/commit/PR workflow the default mode appends.
+const promptModeRaw = "raw"
 
 // checkSessionParams are the parameters for the check_session tool.
 type checkSessionParams struct {
@@ -300,6 +358,8 @@ func (p *Plugin) callCodeQA(ctx context.Context, payload string) (string, error)
 
 	session, err := p.client.CreateSession(ctx, devin.CreateSessionRequest{
 		Prompt: prompt,
+		Title:  params.Title,
+		Tags:   params.Tags,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create devin session: %w", err)
@@ -311,10 +371,11 @@ func (p *Plugin) callCodeQA(ctx context.Context, payload string) (string, error)
 	}
 
 	messages, msgErr := p.client.GetMessages(ctx, session.SessionID)
+	insights, _ := p.client.GetSessionInsights(ctx, session.SessionID)
 
 	p.finalizeSession(ctx, session.SessionID)
 
-	return formatQAResult(session.SessionID, session.URL, status, messages, msgErr), nil
+	return p.formatQAResult(session.SessionID, session.URL, status, messages, msgErr, insights), nil
 }
 
 // callCodeReview creates a Devin session to review a PR and polls until completion.
@@ -331,6 +392,8 @@ func (p *Plugin) callCodeReview(ctx context.Context, payload string) (string, er
 
 	session, err := p.client.CreateSession(ctx, devin.CreateSessionRequest{
 		Prompt: prompt,
+		Title:  params.Title,
+		Tags:   params.Tags,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create devin session: %w", err)
@@ -342,10 +405,11 @@ func (p *Plugin) callCodeReview(ctx context.Context, payload string) (string, er
 	}
 
 	messages, msgErr := p.client.GetMessages(ctx, session.SessionID)
+	insights, _ := p.client.GetSessionInsights(ctx, session.SessionID)
 
 	p.finalizeSession(ctx, session.SessionID)
 
-	return formatReviewResult(session.SessionID, session.URL, status, messages, msgErr), nil
+	return p.formatReviewResult(session.SessionID, session.URL, status, messages, msgErr, insights), nil
 }
 
 // callCodeDevelop creates a Devin session to develop code on a repo and polls until completion.
@@ -361,11 +425,17 @@ func (p *Plugin) callCodeDevelop(ctx context.Context, payload string) (string, e
 		return "", fmt.Errorf("task is required")
 	}
 
-	prompt := buildDevelopPrompt(params.Task, params.Branch, params.Instructions)
+	if params.PromptMode != "" && params.PromptMode != promptModeRaw && params.PromptMode != "default" {
+		return "", fmt.Errorf("invalid prompt_mode %q: expected \"default\" or \"raw\"", params.PromptMode)
+	}
+
+	prompt := buildDevelopPrompt(params.Task, params.Branch, params.Instructions, params.PromptMode == promptModeRaw)
 
 	session, err := p.client.CreateSession(ctx, devin.CreateSessionRequest{
 		Prompt: prompt,
 		Repos:  []string{params.RepoURL},
+		Title:  params.Title,
+		Tags:   params.Tags,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create devin session: %w", err)
@@ -377,10 +447,11 @@ func (p *Plugin) callCodeDevelop(ctx context.Context, payload string) (string, e
 	}
 
 	messages, msgErr := p.client.GetMessages(ctx, session.SessionID)
+	insights, _ := p.client.GetSessionInsights(ctx, session.SessionID)
 
 	p.finalizeSession(ctx, session.SessionID)
 
-	return formatDevelopResult(session.SessionID, session.URL, status, messages, msgErr), nil
+	return p.formatDevelopResult(session.SessionID, session.URL, status, messages, msgErr, insights), nil
 }
 
 // callCheckSession retrieves the full status, messages, and insights for an existing Devin session.
@@ -403,7 +474,7 @@ func (p *Plugin) callCheckSession(ctx context.Context, payload string) (string, 
 	// Insights are best-effort; they may not be available for all sessions.
 	insights, _ := p.client.GetSessionInsights(ctx, params.SessionID)
 
-	return formatCheckSessionResult(params.SessionID, status, messages, msgErr, insights), nil
+	return p.formatCheckSessionResult(params.SessionID, status, messages, msgErr, insights), nil
 }
 
 // callSendMessage sends a follow-up message to an existing session and polls
@@ -431,7 +502,9 @@ func (p *Plugin) callSendMessage(ctx context.Context, payload string) (string, e
 
 	messages, msgErr := p.client.GetMessages(ctx, params.SessionID)
 
-	return formatSendMessageResult(params.SessionID, status, messages, msgErr), nil
+	insights, _ := p.client.GetSessionInsights(ctx, params.SessionID)
+
+	return p.formatSendMessageResult(params.SessionID, status, messages, msgErr, insights), nil
 }
 
 // callCompleteSession finalizes a session by archiving it. This is the explicit
@@ -512,8 +585,26 @@ func buildReviewPrompt(prURL string, instructions string) string {
 	return b.String()
 }
 
-// buildDevelopPrompt constructs the Devin prompt for a development task.
-func buildDevelopPrompt(task, branch, instructions string) string {
+// buildDevelopPrompt constructs the Devin prompt for a development task. In raw
+// mode the task and instructions are passed through untouched: the branch /
+// tests / commit / PR workflow below is wrong for a read-only investigation, and
+// for work that must continue on a branch and PR that already exist.
+func buildDevelopPrompt(task, branch, instructions string, raw bool) string {
+	if raw {
+		var b strings.Builder
+		b.WriteString(task)
+		if branch != "" {
+			b.WriteString("\n\nBranch: ")
+			b.WriteString(branch)
+		}
+		if instructions != "" {
+			b.WriteString("\n\n")
+			b.WriteString(instructions)
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
+
 	var b strings.Builder
 	b.WriteString("Task: ")
 	b.WriteString(task)
@@ -559,26 +650,121 @@ func formatPullRequests(prs []devin.PullRequest) string {
 	return b.String()
 }
 
-// formatDevinResponse writes the "--- Devin's Response ---" section with
-// the raw messages JSON payload or an appropriate fallback.
-func formatDevinResponse(b *strings.Builder, sessionURL string, messagesJSON string, msgErr error) {
+// formatDevinResponse writes the "--- Devin's Response ---" section. By default
+// it carries Devin's final message only; with raw_messages = true it carries the
+// entire messages JSON payload, which is large enough to crowd out everything
+// else in the caller's context.
+func (p *Plugin) formatDevinResponse(b *strings.Builder, sessionURL string, messagesJSON string, msgErr error) {
 	b.WriteString("--- Devin's Response ---\n\n")
-	if msgErr != nil {
+	switch {
+	case msgErr != nil:
 		b.WriteString("Devin returned an error in messaging. Review this session at ")
 		b.WriteString(sessionURL)
 		b.WriteString("\nError detail: ")
 		b.WriteString(msgErr.Error())
 		b.WriteString("\n")
-	} else if messagesJSON != "" {
+	case messagesJSON == "":
+		b.WriteString("Devin did not return a message. Continue to the next task.\n")
+	case p.rawMessages:
 		b.WriteString(messagesJSON)
 		b.WriteString("\n")
-	} else {
-		b.WriteString("Devin did not return a message. Continue to the next task.\n")
+	default:
+		last, ok := lastDevinMessage(messagesJSON)
+		if !ok {
+			// Unrecognised payload shape: fall back to the raw JSON rather than
+			// silently dropping what Devin said.
+			b.WriteString(messagesJSON)
+			b.WriteString("\n")
+			return
+		}
+		if last == "" {
+			b.WriteString("Devin did not return a message. Continue to the next task.\n")
+			return
+		}
+		b.WriteString(last)
+		b.WriteString("\n\nFull transcript: ")
+		b.WriteString(sessionURL)
+		b.WriteString("\n")
+	}
+}
+
+// lastDevinMessage extracts Devin's final message from the messages endpoint
+// payload. It reports false when the payload doesn't parse into a recognised
+// shape, so the caller can fall back to returning it verbatim.
+func lastDevinMessage(messagesJSON string) (string, bool) {
+	var entries []map[string]any
+
+	if err := json.Unmarshal([]byte(messagesJSON), &entries); err != nil {
+		var wrapper struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(messagesJSON), &wrapper); err != nil || wrapper.Messages == nil {
+			return "", false
+		}
+		entries = wrapper.Messages
+	}
+
+	// Walk backwards for the last entry Devin authored; a session ends with
+	// Devin's summary unless it stopped to ask something.
+	for i := len(entries) - 1; i >= 0; i-- {
+		if !isDevinAuthored(entries[i]) {
+			continue
+		}
+		if text := messageText(entries[i]); text != "" {
+			return text, true
+		}
+	}
+
+	return "", true
+}
+
+// isDevinAuthored reports whether a message entry came from Devin rather than
+// from the caller. Entries without any type/origin field are assumed to be
+// Devin's, since the alternative is dropping the response entirely.
+func isDevinAuthored(entry map[string]any) bool {
+	for _, key := range []string{"type", "origin", "role", "source", "author"} {
+		v, ok := entry[key].(string)
+		if !ok || v == "" {
+			continue
+		}
+		v = strings.ToLower(v)
+		if strings.Contains(v, "devin") || strings.Contains(v, "assistant") || strings.Contains(v, "agent") {
+			return true
+		}
+		if strings.Contains(v, "user") || strings.Contains(v, "human") {
+			return false
+		}
+	}
+	return true
+}
+
+// messageText pulls the human-readable body out of a message entry, whichever
+// field name the API used for it.
+func messageText(entry map[string]any) string {
+	for _, key := range []string{"message", "text", "content", "body"} {
+		if v, ok := entry[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// formatStructuredOutput writes the session's structured output, which is the
+// part a mission routes on — so it is included in every result, not only in
+// check_session.
+func formatStructuredOutput(b *strings.Builder, insight *devin.SessionInsight) {
+	if insight == nil || len(insight.StructuredOutput) == 0 {
+		return
+	}
+	if s := string(insight.StructuredOutput); s != "{}" && s != "null" {
+		b.WriteString("--- Structured Output ---\n\n")
+		b.WriteString(s)
+		b.WriteString("\n\n")
 	}
 }
 
 // formatQAResult formats the QA session result into a readable text summary.
-func formatQAResult(sessionID, sessionURL string, status *devin.SessionStatus, messagesJSON string, msgErr error) string {
+func (p *Plugin) formatQAResult(sessionID, sessionURL string, status *devin.SessionStatus, messagesJSON string, msgErr error, insights *devin.SessionInsight) string {
 	var b strings.Builder
 	b.WriteString("=== Devin QA Review Complete ===\n\n")
 	b.WriteString(fmt.Sprintf("Session: %s\n", sessionID))
@@ -593,7 +779,9 @@ func formatQAResult(sessionID, sessionURL string, status *devin.SessionStatus, m
 		b.WriteString(fmt.Sprintf("Title: %s\n\n", status.Title))
 	}
 
-	formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
+	formatStructuredOutput(&b, insights)
+
+	p.formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
 
 	b.WriteString("\nView the full Devin session for detailed findings: ")
 	b.WriteString(sessionURL)
@@ -603,7 +791,7 @@ func formatQAResult(sessionID, sessionURL string, status *devin.SessionStatus, m
 }
 
 // formatReviewResult formats the code review session result into a readable text summary.
-func formatReviewResult(sessionID, sessionURL string, status *devin.SessionStatus, messagesJSON string, msgErr error) string {
+func (p *Plugin) formatReviewResult(sessionID, sessionURL string, status *devin.SessionStatus, messagesJSON string, msgErr error, insights *devin.SessionInsight) string {
 	var b strings.Builder
 	b.WriteString("=== Devin Code Review Complete ===\n\n")
 	b.WriteString(fmt.Sprintf("Session: %s\n", sessionID))
@@ -624,7 +812,9 @@ func formatReviewResult(sessionID, sessionURL string, status *devin.SessionStatu
 		b.WriteString("\n")
 	}
 
-	formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
+	formatStructuredOutput(&b, insights)
+
+	p.formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
 
 	b.WriteString("\nReview comments have been posted directly on the GitHub PR.\n")
 	b.WriteString("View the full Devin session: ")
@@ -635,7 +825,7 @@ func formatReviewResult(sessionID, sessionURL string, status *devin.SessionStatu
 }
 
 // formatDevelopResult formats the development session result into a readable text summary.
-func formatDevelopResult(sessionID, sessionURL string, status *devin.SessionStatus, messagesJSON string, msgErr error) string {
+func (p *Plugin) formatDevelopResult(sessionID, sessionURL string, status *devin.SessionStatus, messagesJSON string, msgErr error, insights *devin.SessionInsight) string {
 	var b strings.Builder
 	b.WriteString("=== Devin Development Complete ===\n\n")
 	b.WriteString(fmt.Sprintf("Session: %s\n", sessionID))
@@ -656,7 +846,9 @@ func formatDevelopResult(sessionID, sessionURL string, status *devin.SessionStat
 		b.WriteString("\n")
 	}
 
-	formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
+	formatStructuredOutput(&b, insights)
+
+	p.formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
 
 	b.WriteString("\nView the full Devin session for details: ")
 	b.WriteString(sessionURL)
@@ -666,7 +858,7 @@ func formatDevelopResult(sessionID, sessionURL string, status *devin.SessionStat
 }
 
 // formatSendMessageResult formats the result of a follow-up message into a readable text summary.
-func formatSendMessageResult(sessionID string, status *devin.SessionStatus, messagesJSON string, msgErr error) string {
+func (p *Plugin) formatSendMessageResult(sessionID string, status *devin.SessionStatus, messagesJSON string, msgErr error, insights *devin.SessionInsight) string {
 	var b strings.Builder
 	b.WriteString("=== Devin Follow-up Complete ===\n\n")
 	b.WriteString(fmt.Sprintf("Session: %s\n", sessionID))
@@ -693,7 +885,9 @@ func formatSendMessageResult(sessionID string, status *devin.SessionStatus, mess
 	if sessionURL == "" {
 		sessionURL = "https://app.devin.ai/sessions/" + sessionID
 	}
-	formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
+	formatStructuredOutput(&b, insights)
+
+	p.formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
 
 	b.WriteString("\nThe session is still open. Send another message to continue, ")
 	b.WriteString("or call complete_session to finalize it.\n")
@@ -702,7 +896,7 @@ func formatSendMessageResult(sessionID string, status *devin.SessionStatus, mess
 }
 
 // formatCheckSessionResult formats a session status check into a readable text summary.
-func formatCheckSessionResult(sessionID string, status *devin.SessionStatus, messagesJSON string, msgErr error, insights *devin.SessionInsight) string {
+func (p *Plugin) formatCheckSessionResult(sessionID string, status *devin.SessionStatus, messagesJSON string, msgErr error, insights *devin.SessionInsight) string {
 	var b strings.Builder
 	b.WriteString("=== Devin Session Status ===\n\n")
 	b.WriteString(fmt.Sprintf("Session: %s\n", sessionID))
@@ -730,7 +924,9 @@ func formatCheckSessionResult(sessionID string, status *devin.SessionStatus, mes
 	if sessionURL == "" {
 		sessionURL = "https://app.devin.ai/sessions/" + sessionID
 	}
-	formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
+	formatStructuredOutput(&b, insights)
+
+	p.formatDevinResponse(&b, sessionURL, messagesJSON, msgErr)
 
 	if insights != nil {
 		formatInsights(&b, insights)
@@ -780,9 +976,5 @@ func formatInsights(b *strings.Builder, insight *devin.SessionInsight) {
 				b.WriteString(fmt.Sprintf("  - %s\n", entry))
 			}
 		}
-	}
-
-	if len(insight.StructuredOutput) > 0 && string(insight.StructuredOutput) != "{}" && string(insight.StructuredOutput) != "null" {
-		b.WriteString(fmt.Sprintf("\nStructured Output: %s\n", string(insight.StructuredOutput)))
 	}
 }
