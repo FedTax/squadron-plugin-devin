@@ -13,9 +13,9 @@ env:
   # checksums.txt. See squadron/internal/release/download.go:ArchiveURLs.
   REPO: squadron-plugin-devin
 
-  # Path to the package whose main() registers the plugin. Change if your
-  # entrypoint lives elsewhere.
-  MAIN_PKG: ./cmd/plugin
+  # Path to the package whose main() registers the plugin. This repo's
+  # entrypoint is main.go at the module root.
+  MAIN_PKG: .
 
   GO_VERSION: "1.23"
 
@@ -74,10 +74,15 @@ jobs:
             -o "$STAGE/$BIN" \
             "$PKG"
 
+          # Squadron needs runner.json beside the binary in the extracted
+          # archive; without it loading fails with "no runner.json or plugin
+          # binary found".
+          printf '{\n  "kind": "go",\n  "entry": "%s"\n}\n' "$BIN" > "$STAGE/runner.json"
+
           if [[ "$EXT" == "zip" ]]; then
-            (cd "$STAGE" && zip -q "$GITHUB_WORKSPACE/dist/$ARCHIVE" "$BIN")
+            (cd "$STAGE" && zip -q "$GITHUB_WORKSPACE/dist/$ARCHIVE" "$BIN" runner.json)
           else
-            tar -C "$STAGE" -czf "dist/$ARCHIVE" "$BIN"
+            tar -C "$STAGE" -czf "dist/$ARCHIVE" "$BIN" runner.json
           fi
 
           ls -lh "dist/$ARCHIVE"
