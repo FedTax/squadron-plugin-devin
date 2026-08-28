@@ -138,6 +138,34 @@ var tools = map[string]*squadron.ToolInfo{
 			Required: []string{"session_id", "message"},
 		},
 	},
+	"find_sessions": {
+		Name: "find_sessions",
+		Description: "Find existing Devin sessions by tag, so a workflow can discover what has already " +
+			"been done for a ticket instead of being handed session ids. Returns one line per " +
+			"matching session — id, status, title, PR link, timestamps — for the sessions " +
+			"carrying ALL of the given tags. Pass the resulting session id to check_session for " +
+			"detail, or to send_message to continue that session.",
+		Schema: squadron.Schema{
+			Type: squadron.TypeObject,
+			Properties: squadron.PropertyMap{
+				"tags": {
+					Type: squadron.TypeArray,
+					Description: "Tags a session must ALL carry to match (e.g. [\"DEV-8126\"] for every " +
+						"session on a ticket, or [\"DEV-8126\", \"rate-investigation\"] for that " +
+						"ticket's investigation only). Tags are matched exactly, so they must be the " +
+						"tags the sessions were created with.",
+					Items: &squadron.Property{
+						Type: squadron.TypeString,
+					},
+				},
+				"limit": {
+					Type:        squadron.TypeNumber,
+					Description: "Maximum number of sessions to return. Defaults to 20.",
+				},
+			},
+			Required: []string{"tags"},
+		},
+	},
 	"complete_session": {
 		Name: "complete_session",
 		Description: "Finalize and archive a Devin session. Call this upon mission finalization " +
@@ -272,6 +300,8 @@ func (p *Plugin) Call(ctx context.Context, toolName string, payload string) (str
 		return p.callCheckSession(ctx, payload)
 	case "send_message":
 		return p.callSendMessage(ctx, payload)
+	case "find_sessions":
+		return p.callFindSessions(ctx, payload)
 	case "complete_session":
 		return p.callCompleteSession(ctx, payload)
 	default:
@@ -342,6 +372,12 @@ type sendMessageParams struct {
 // completeSessionParams are the parameters for the complete_session tool.
 type completeSessionParams struct {
 	SessionID string `json:"session_id"`
+}
+
+// findSessionsParams are the parameters for the find_sessions tool.
+type findSessionsParams struct {
+	Tags  []string `json:"tags"`
+	Limit int      `json:"limit,omitempty"`
 }
 
 // callCodeQA creates a Devin session to perform QA on a PR and polls until completion.
@@ -505,6 +541,69 @@ func (p *Plugin) callSendMessage(ctx context.Context, payload string) (string, e
 	insights, _ := p.client.GetSessionInsights(ctx, params.SessionID)
 
 	return p.formatSendMessageResult(params.SessionID, status, messages, msgErr, insights), nil
+}
+
+// callFindSessions lists the sessions carrying every given tag, so a caller can
+// discover prior work on a ticket rather than being passed session ids.
+func (p *Plugin) callFindSessions(ctx context.Context, payload string) (string, error) {
+	var params findSessionsParams
+	if err := json.Unmarshal([]byte(payload), &params); err != nil {
+		return "", fmt.Errorf("invalid payload: %w", err)
+	}
+	if len(params.Tags) == 0 {
+		return "", fmt.Errorf("tags is required and must contain at least one tag")
+	}
+
+	sessions, err := p.client.ListSessionsByTags(ctx, params.Tags, params.Limit)
+	if err != nil {
+		return "", fmt.Errorf("find sessions by tags %v: %w", params.Tags, err)
+	}
+
+	return formatFindSessionsResult(params.Tags, sessions), nil
+}
+
+// formatFindSessionsResult renders one line per session. An empty result is a
+// real answer — "no session exists for this ticket yet" — not an error, so it
+// says so explicitly rather than returning an empty body the caller has to
+// guess about.
+func formatFindSessionsResult(tags []string, sessions []devin.SessionSummary) string {
+	var b strings.Builder
+	b.WriteString("=== Devin Sessions ===\n\n")
+	b.WriteString(fmt.Sprintf("Tags: %s\n", strings.Join(tags, ", ")))
+	b.WriteString(fmt.Sprintf("Matches: %d\n\n", len(sessions)))
+
+	if len(sessions) == 0 {
+		b.WriteString("No session carries all of those tags. Nothing has been started for them yet,\n")
+		b.WriteString("or the sessions that were started carry different tags.\n")
+		return b.String()
+	}
+
+	for _, s := range sessions {
+		status := s.Status
+		if s.StatusEnum != "" {
+			status = fmt.Sprintf("%s (%s)", status, s.StatusEnum)
+		}
+		b.WriteString(fmt.Sprintf("- %s — %s\n", s.SessionID, status))
+		if s.Title != "" {
+			b.WriteString(fmt.Sprintf("    title: %s\n", s.Title))
+		}
+		if s.PullRequest != nil && s.PullRequest.URL != "" {
+			b.WriteString(fmt.Sprintf("    pr: %s\n", s.PullRequest.URL))
+		}
+		if s.CreatedAt != "" {
+			b.WriteString(fmt.Sprintf("    created: %s\n", s.CreatedAt))
+		}
+		if s.UpdatedAt != "" {
+			b.WriteString(fmt.Sprintf("    updated: %s\n", s.UpdatedAt))
+		}
+		if len(s.Tags) > 0 {
+			b.WriteString(fmt.Sprintf("    tags: %s\n", strings.Join(s.Tags, ", ")))
+		}
+		b.WriteString(fmt.Sprintf("    url: https://app.devin.ai/sessions/%s\n", s.SessionID))
+	}
+
+	b.WriteString("\nUse check_session for a session's detail, or send_message to continue it.\n")
+	return b.String()
 }
 
 // callCompleteSession finalizes a session by archiving it. This is the explicit
