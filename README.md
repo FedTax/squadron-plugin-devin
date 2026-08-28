@@ -63,6 +63,43 @@ If a session has no playbook schema, `structured_output` is empty and the sectio
 stage has to fall back to reading Devin's final message, which is exactly the ambiguity the
 schemas exist to remove.
 
+### Devin API surface
+
+Everything goes through five organization-scoped v3 endpoints on `https://api.devin.ai/v3`
+(`devin/client.go`), authenticated with `Authorization: Bearer <api_key>`:
+
+| Call | Endpoint | Used for |
+|---|---|---|
+| `CreateSession` | `POST /organizations/{org}/sessions` | `{prompt, repos, title, tags}`. `repos` is how `code_develop` grants repo access; `title`/`tags` are metadata only and never reach the prompt. |
+| `GetSession` | `GET .../sessions/{id}` | poll target: `status`, `status_detail`, `pull_requests` |
+| `GetMessages` | `GET .../sessions/{id}/messages` | the transcript, returned as raw JSON |
+| `GetSessionInsights` | `GET .../sessions/insights?session_ids={id}` | `structured_output` plus Devin's analysis (issues, action items, timeline) |
+| `SendMessage` / `ArchiveSession` | `POST .../messages`, `POST .../archive` | resume, and finalize |
+
+**Polling.** `PollUntilDone` ticks every 15s until a terminal state, and tolerates 5 *consecutive*
+transient `GetSession` failures before giving up (the counter resets on any success), so a brief
+API blip doesn't kill a long session. Terminal means either `status` in
+`exit | error | suspended | sleeping | waiting_for_user`, **or** `status_detail` in
+`waiting_for_user | finished` while `status` is still `running` — that second case is the normal
+end of a successful session, since Devin stays running and awaits follow-up. Hitting
+`poll_timeout_minutes` is an error, not a result: the session keeps going on Devin's side, so
+recover it with `check_session` rather than re-running the stage.
+
+A tool result is assembled from those calls in order — header and `Pull Requests` from
+`GetSession`, `Structured Output` from `GetSessionInsights`, `Devin's Response` from
+`GetMessages`. Failures downgrade rather than abort: a failed `GetMessages` prints the error plus
+the session URL, and absent insights simply omit their section, so a stage still gets the session
+ID and PR links.
+
+**Message extraction.** The messages payload is not a stable shape, so `lastDevinMessage` is
+deliberately forgiving: it accepts either a bare array or `{"messages": [...]}`, walks **backwards**
+to the last Devin-authored entry (a session ends with Devin's summary unless it stopped to ask a
+question, in which case that question is what you want), sniffs authorship across
+`type`/`origin`/`role`/`source`/`author`, and reads the body from whichever of
+`message`/`text`/`content`/`body` is populated. Any entry with no recognizable authorship field is
+treated as Devin's, and an unparseable payload falls back to printing the raw JSON — both
+biased toward showing you something over silently dropping what Devin said.
+
 ### Prompt modes
 
 `code_develop` builds the prompt for you. In `default` mode it appends a fixed workflow — create a
