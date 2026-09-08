@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -31,6 +33,34 @@ const (
 	// during polling before giving up.
 	maxPollErrors = 5
 )
+
+// APIError carries the HTTP status of a failed Devin API call, so a caller can
+// distinguish "this key may not read that" from "the call went wrong". The
+// organization-scoped v3 reads are gated on ViewOrgSessions, which a service
+// user with the default Member role does not hold; the per-session v1 reads are
+// scoped to what the key itself can see. Telling the two apart is what lets the
+// v3 reads fall back to v1 rather than failing the stage.
+type APIError struct {
+	StatusCode int
+	Endpoint   string
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("devin API error (status %d) from %s: %s", e.StatusCode, e.Endpoint, e.Body)
+}
+
+// Forbidden reports whether the call was refused for lack of permission, as
+// opposed to failing for any other reason.
+func (e *APIError) Forbidden() bool {
+	return e.StatusCode == http.StatusForbidden || e.StatusCode == http.StatusUnauthorized
+}
+
+// isForbidden reports whether err is a permission refusal from the API.
+func isForbidden(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Forbidden()
+}
 
 // Client communicates with the Devin AI v3 API.
 type Client struct {
@@ -162,9 +192,11 @@ func (c *Client) SendMessage(ctx context.Context, sessionID, message string) err
 	return nil
 }
 
-// GetSession retrieves the current status of a Devin session.
+// GetSession retrieves the current status of a Devin session, falling back to
+// the v1 per-session endpoint when the organization-scoped read is refused.
 func (c *Client) GetSession(ctx context.Context, sessionID string) (*SessionStatus, error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.orgURL()+"/sessions/"+sessionID, nil)
+	endpoint := c.orgURL() + "/sessions/" + sessionID
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -178,10 +210,91 @@ func (c *Client) GetSession(ctx context.Context, sessionID string) (*SessionStat
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("devin API error (status %d): %s", resp.StatusCode, string(respBody))
+		apiErr := &APIError{StatusCode: resp.StatusCode, Endpoint: endpoint, Body: string(respBody)}
+		if apiErr.Forbidden() {
+			detail, v1Err := c.getSessionV1(ctx, sessionID)
+			if v1Err != nil {
+				return nil, fmt.Errorf("%w (v1 fallback also failed: %v)", apiErr, v1Err)
+			}
+			return detail.toStatus(), nil
+		}
+		return nil, apiErr
 	}
 
 	var result SessionStatus
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &result, nil
+}
+
+// sessionDetailV1 is the v1 per-session response. It is scoped to what the API
+// key can see rather than to the organization, so it answers for a session the
+// key created even where the v3 organization reads are refused. It carries the
+// two things the v3 reads are wanted for — the status and the structured
+// output — plus the transcript.
+//
+//	GET /v1/sessions/{session_id}
+//
+// See https://docs.devin.ai/api-reference/v1/sessions/retrieve-details-about-an-existing-session
+type sessionDetailV1 struct {
+	SessionID        string          `json:"session_id"`
+	Status           string          `json:"status"`
+	StatusEnum       string          `json:"status_enum"`
+	Title            string          `json:"title"`
+	Tags             []string        `json:"tags"`
+	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
+	Messages         json.RawMessage `json:"messages,omitempty"`
+	PullRequest      *struct {
+		URL string `json:"url"`
+	} `json:"pull_request"`
+}
+
+// toStatus maps a v1 detail onto the status shape the poller and the formatters
+// read. v1 reports the lifecycle in status_enum (working, blocked, expired,
+// finished, ...) where v3 reports it in status, so the enum becomes the status
+// and the v3-shaped detail field carries it too — the poller's terminal check
+// looks at both, and dropping one would make a finished session read as still
+// working.
+func (d *sessionDetailV1) toStatus() *SessionStatus {
+	status := d.StatusEnum
+	if status == "" {
+		status = d.Status
+	}
+	result := &SessionStatus{
+		SessionID:    d.SessionID,
+		Status:       status,
+		StatusDetail: status,
+		Title:        d.Title,
+		URL:          "https://app.devin.ai/sessions/" + strings.TrimPrefix(d.SessionID, "devin-"),
+	}
+	if d.PullRequest != nil && d.PullRequest.URL != "" {
+		result.PullRequests = []PullRequest{{URL: d.PullRequest.URL}}
+	}
+	return result
+}
+
+// getSessionV1 reads a session through the v1 per-session endpoint.
+func (c *Client) getSessionV1(ctx context.Context, sessionID string) (*sessionDetailV1, error) {
+	endpoint := v1BaseURL + "/sessions/" + sessionID
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, &APIError{StatusCode: resp.StatusCode, Endpoint: endpoint, Body: string(respBody)}
+	}
+
+	var result sessionDetailV1
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
@@ -217,7 +330,18 @@ func (c *Client) GetMessages(ctx context.Context, sessionID string) (string, err
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("devin API error (status %d): %s", resp.StatusCode, string(body))
+		apiErr := &APIError{StatusCode: resp.StatusCode, Endpoint: url, Body: string(body)}
+		if apiErr.Forbidden() {
+			detail, v1Err := c.getSessionV1(ctx, sessionID)
+			if v1Err != nil {
+				return "", fmt.Errorf("%w (v1 fallback also failed: %v)", apiErr, v1Err)
+			}
+			if len(detail.Messages) == 0 {
+				return "", fmt.Errorf("%w (v1 fallback returned no messages)", apiErr)
+			}
+			return string(detail.Messages), nil
+		}
+		return "", apiErr
 	}
 
 	if len(body) == 0 {
@@ -285,7 +409,27 @@ func (c *Client) GetSessionInsights(ctx context.Context, sessionID string) (*Ses
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("devin API error (status %d): %s", resp.StatusCode, string(respBody))
+		apiErr := &APIError{StatusCode: resp.StatusCode, Endpoint: url, Body: string(respBody)}
+		if apiErr.Forbidden() {
+			// Insights are how structured_output reaches a mission's routers, so
+			// losing them to a permission is not cosmetic. v1 carries the same
+			// field without Devin's analysis, which nothing routes on.
+			detail, v1Err := c.getSessionV1(ctx, sessionID)
+			if v1Err != nil {
+				return nil, fmt.Errorf("%w (v1 fallback also failed: %v)", apiErr, v1Err)
+			}
+			status := detail.toStatus()
+			return &SessionInsight{
+				SessionID:        status.SessionID,
+				Status:           status.Status,
+				StatusDetail:     status.StatusDetail,
+				Title:            status.Title,
+				URL:              status.URL,
+				PullRequests:     status.PullRequests,
+				StructuredOutput: detail.StructuredOutput,
+			}, nil
+		}
+		return nil, apiErr
 	}
 
 	var result insightsResponse
@@ -339,14 +483,18 @@ type SessionSummary struct {
 }
 
 // listSessionsQuery builds the query string for a tag search. Each tag is a
-// repeated `tags` parameter, which is how the endpoint expresses a list.
-func listSessionsQuery(tags []string, limit int) url.Values {
+// repeated `tags` parameter, which is how the endpoint expresses a list. A
+// userEmail narrows the search to that creator's sessions.
+func listSessionsQuery(tags []string, limit int, userEmail string) url.Values {
 	if limit <= 0 {
 		limit = defaultListLimit
 	}
 	query := url.Values{}
 	for _, tag := range tags {
 		query.Add("tags", tag)
+	}
+	if userEmail != "" {
+		query.Set("user_email", userEmail)
 	}
 	query.Set("limit", strconv.Itoa(limit))
 	return query
@@ -367,12 +515,16 @@ type listSessionsResponse struct {
 // the v3 list endpoint takes an undocumented `qs` query-params object. The
 // organization is the one the API key belongs to, so orgID is not in the path.
 //
+// A userEmail narrows the search to the sessions that address created. That is
+// the only lever where the unfiltered search is refused: unlike the per-session
+// reads, no self-scoped list endpoint exists to fall back to.
+//
 // See https://docs.devin.ai/api-reference/v1/sessions/list-sessions
-func (c *Client) ListSessionsByTags(ctx context.Context, tags []string, limit int) ([]SessionSummary, error) {
+func (c *Client) ListSessionsByTags(ctx context.Context, tags []string, limit int, userEmail string) ([]SessionSummary, error) {
 	if len(tags) == 0 {
 		return nil, fmt.Errorf("at least one tag is required")
 	}
-	endpoint := v1BaseURL + "/sessions?" + listSessionsQuery(tags, limit).Encode()
+	endpoint := v1BaseURL + "/sessions?" + listSessionsQuery(tags, limit, userEmail).Encode()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -387,7 +539,11 @@ func (c *Client) ListSessionsByTags(ctx context.Context, tags []string, limit in
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("devin API error (status %d): %s", resp.StatusCode, string(respBody))
+		apiErr := &APIError{StatusCode: resp.StatusCode, Endpoint: endpoint, Body: string(respBody)}
+		if apiErr.Forbidden() {
+			return nil, fmt.Errorf("%w — listing sessions is an organization-wide read (ViewOrgSessions); a refusal here says the history cannot be seen, NOT that the tag has no sessions", apiErr)
+		}
+		return nil, apiErr
 	}
 
 	var result listSessionsResponse
@@ -411,6 +567,12 @@ func (c *Client) ListSessionsByTags(ctx context.Context, tags []string, limit in
 // Secondary (by status_detail while status is still "running"):
 //   - "waiting_for_user": Devin finished its task and is waiting for follow-up
 //   - "finished": task completed
+//
+// Where the v3 read is refused and GetSession answers from v1 instead, the
+// status carries v1's status_enum, whose terminal values are named differently
+// ("blocked" for waiting on a human, "expired" and "stopped" for ended). They
+// are matched too: unrecognised terminal states are indistinguishable from
+// still-working ones, so a finished session would poll until the timeout.
 func (c *Client) PollUntilDone(ctx context.Context, sessionID string, pollInterval, pollTimeout time.Duration) (*SessionStatus, error) {
 	if pollInterval == 0 {
 		pollInterval = defaultPollInterval
@@ -443,9 +605,11 @@ func (c *Client) PollUntilDone(ctx context.Context, sessionID string, pollInterv
 			}
 			consecutiveErrors = 0
 
-			// Primary terminal states (session is no longer running)
+			// Primary terminal states (session is no longer running), v3 names
+			// first and v1's status_enum names after.
 			switch status.Status {
-			case "exit", "error", "suspended", "sleeping", "waiting_for_user":
+			case "exit", "error", "suspended", "sleeping", "waiting_for_user",
+				"blocked", "expired", "stopped":
 				return status, nil
 			}
 

@@ -48,9 +48,9 @@ This is the part a mission should **route on**; the prose response is for humans
 
 It comes from Devin, not from this plugin: when a session runs a playbook that defines a
 `structured_output_schema`, Devin populates `structured_output` on the session, and the plugin
-reads it back from `GET /v3/organizations/{org_id}/sessions/insights` and prints it verbatim in
-every result (not just `check_session`). A mission then parses those fields for its router
-conditions, e.g.:
+reads it back from `GET /v3/organizations/{org_id}/sessions/insights` (or from the v1 session, if
+that read is refused) and prints it verbatim in every result (not just `check_session`). A mission
+then parses those fields for its router conditions, e.g.:
 
 ```hcl
 # the investigation playbook's schema emits { "verdict": "...", "evidence_complete": true }
@@ -83,12 +83,42 @@ filtering is documented, while the v3 list endpoint takes an undocumented `qs` o
 key; the organization is implied by the key rather than being in the path. The list response is a
 summary — no structured output — so `check_session` is still what fetches a session's detail.
 
+### Permissions, and the v1 fallback
+
+The organization-scoped paths above are gated on Devin's `ViewOrgSessions` / `ManageOrgSessions`
+permissions, which a service user with the default **Member** role does not hold — it can create
+sessions and read its own, but the `/v3/organizations/{org}/...` reads are refused with a 403 even
+for a session it created itself. So each of the three v3 reads retries against the v1 per-session
+endpoint, `GET /v1/sessions/{id}`, which is scoped to what the key can see rather than to the
+organization:
+
+| Refused v3 read | Retried as | Caveat |
+|---|---|---|
+| `GetSession` | `GET /v1/sessions/{id}` | v1 reports the lifecycle in `status_enum` (`working`, `blocked`, `finished`, `expired`, ...), which is mapped onto `status`; the poller matches both vocabularies. |
+| `GetSessionInsights` | same call, `structured_output` field | the routable field survives; Devin's analysis (issues, action items, timeline) does not exist in v1 and is lost. |
+| `GetMessages` | same call, `messages` field | shape differs from the v3 transcript; `lastDevinMessage` is forgiving enough for both. |
+
+A 403 is retried, any other failure is returned as-is: falling back on a 500 would hide a real
+outage behind a second call that fails the same way.
+
+**`find_sessions` has no such fallback**, and this is the one capability a Member service user
+cannot recover on its own: listing is inherently an organization-wide read, and no self-scoped list
+endpoint exists. Its optional `user_email` narrows the search to one account's sessions, which is
+worth trying with the service user's own address — an org-wide search refused unrestricted may be
+permitted when scoped to the caller — but that is untested against a Member key. On a refusal the
+tool returns an error that says so explicitly, because the failure mode to avoid is a caller
+reading "refused" as "this ticket has no sessions" and starting duplicate work. A workflow that
+needs discovery under a Member key has to record the session ids it creates in its own state and
+read them back through `check_session`.
+
 **Polling.** `PollUntilDone` ticks every 15s until a terminal state, and tolerates 5 *consecutive*
 transient `GetSession` failures before giving up (the counter resets on any success), so a brief
 API blip doesn't kill a long session. Terminal means either `status` in
 `exit | error | suspended | sleeping | waiting_for_user`, **or** `status_detail` in
 `waiting_for_user | finished` while `status` is still `running` — that second case is the normal
-end of a successful session, since Devin stays running and awaits follow-up. Hitting
+end of a successful session, since Devin stays running and awaits follow-up. `blocked | expired |
+stopped` count too, since a status served by the v1 fallback speaks v1's vocabulary and an
+unrecognised terminal state polls to the timeout. Hitting
 `poll_timeout_minutes` is an error, not a result: the session keeps going on Devin's side, so
 recover it with `check_session` rather than re-running the stage.
 
@@ -96,7 +126,8 @@ A tool result is assembled from those calls in order — header and `Pull Reques
 `GetSession`, `Structured Output` from `GetSessionInsights`, `Devin's Response` from
 `GetMessages`. Failures downgrade rather than abort: a failed `GetMessages` prints the error plus
 the session URL, and absent insights simply omit their section, so a stage still gets the session
-ID and PR links.
+ID and PR links. Each of those calls falls back to v1 before it counts as failed, per
+[Permissions, and the v1 fallback](#permissions-and-the-v1-fallback).
 
 **Message extraction.** The messages payload is not a stable shape, so `lastDevinMessage` is
 deliberately forgiving: it accepts either a bare array or `{"messages": [...]}`, walks **backwards**
@@ -232,12 +263,19 @@ match is a normal answer, reported as `Matches: 0`.
 Unlike the other tools this one is a single API call and returns immediately — it creates nothing
 and does not poll.
 
+It is also the one tool a Member service user may not be able to run at all, since listing sessions
+is an organization-wide read with no self-scoped equivalent to fall back to (see
+[Permissions, and the v1 fallback](#permissions-and-the-v1-fallback)). A refusal comes back as an
+error naming the permission, never as `Matches: 0` — the two must not be confused, because reading
+"refused" as "no prior sessions" is what makes a workflow start work that is already underway.
+
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `tags` | string[] | yes | Tags a session must all carry to match |
 | `limit` | number | no | Maximum sessions to return. Defaults to 20. |
+| `user_email` | string | no | Restrict to sessions created by this account. Worth trying with the service user's own address when the unrestricted search is refused. |
 
 ### `complete_session`
 

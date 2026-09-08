@@ -162,6 +162,14 @@ var tools = map[string]*squadron.ToolInfo{
 					Type:        squadron.TypeNumber,
 					Description: "Maximum number of sessions to return. Defaults to 20.",
 				},
+				"user_email": {
+					Type: squadron.TypeString,
+					Description: "Optional: restrict the search to sessions created by this account. " +
+						"Searching is an organization-wide read, so a service user without it is " +
+						"refused; narrowing to its own email is what may be permitted where the " +
+						"unrestricted search is not. A refusal means the history cannot be seen, " +
+						"which is not the same as the tag having no sessions.",
+				},
 			},
 			Required: []string{"tags"},
 		},
@@ -376,8 +384,9 @@ type completeSessionParams struct {
 
 // findSessionsParams are the parameters for the find_sessions tool.
 type findSessionsParams struct {
-	Tags  []string `json:"tags"`
-	Limit int      `json:"limit,omitempty"`
+	Tags      []string `json:"tags"`
+	Limit     int      `json:"limit,omitempty"`
+	UserEmail string   `json:"user_email,omitempty"`
 }
 
 // callCodeQA creates a Devin session to perform QA on a PR and polls until completion.
@@ -554,7 +563,7 @@ func (p *Plugin) callFindSessions(ctx context.Context, payload string) (string, 
 		return "", fmt.Errorf("tags is required and must contain at least one tag")
 	}
 
-	sessions, err := p.client.ListSessionsByTags(ctx, params.Tags, params.Limit)
+	sessions, err := p.client.ListSessionsByTags(ctx, params.Tags, params.Limit, params.UserEmail)
 	if err != nil {
 		return "", fmt.Errorf("find sessions by tags %v: %w", params.Tags, err)
 	}
