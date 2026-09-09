@@ -109,6 +109,61 @@ type SessionStatus struct {
 	URL          string        `json:"url"`
 	PullRequests []PullRequest `json:"pull_requests,omitempty"`
 	IsArchived   bool          `json:"is_archived"`
+	CreatedAt    Timestamp     `json:"created_at"`
+	UpdatedAt    Timestamp     `json:"updated_at"`
+}
+
+// resumeWindow is how long Devin will continue a session for. Past it the
+// session is readable but dead: a send is refused and the web app offers a new
+// session instead. Nothing in the status says so — a month-old session still
+// reads "suspended (inactivity)", the same as one suspended an hour ago — so
+// the age is the only signal a caller has.
+//
+// See https://docs.devin.ai/admin/common-issues#session-expiration
+const resumeWindow = 30 * 24 * time.Hour
+
+// Timestamp is a session time that arrives as epoch seconds from v3 and as
+// RFC 3339 from v1. Both decode; an absent or unparseable one is the zero
+// value, which reads as unknown rather than as 1970.
+type Timestamp struct {
+	time.Time
+}
+
+func (t *Timestamp) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	if secs, err := strconv.ParseFloat(string(data), 64); err == nil {
+		t.Time = time.Unix(int64(secs), 0).UTC()
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return nil
+	}
+	if parsed, err := time.Parse(time.RFC3339, s); err == nil {
+		t.Time = parsed.UTC()
+	}
+	return nil
+}
+
+// Resumable reports whether a session is young enough for Devin to continue.
+// An unknown timestamp is treated as resumable: the caller learns otherwise
+// from the refused send, which beats declaring a live session dead.
+func (s *SessionStatus) Resumable() bool {
+	if s.LastActivity().IsZero() {
+		return true
+	}
+	return time.Since(s.LastActivity()) < resumeWindow
+}
+
+// LastActivity is the most recent of the two timestamps, since v1 and v3 differ
+// on which they populate.
+func (s *SessionStatus) LastActivity() time.Time {
+	if s.UpdatedAt.After(s.CreatedAt.Time) {
+		return s.UpdatedAt.Time
+	}
+	return s.CreatedAt.Time
 }
 
 // PullRequest contains PR information from a session.
@@ -245,6 +300,8 @@ type sessionDetailV1 struct {
 	Tags             []string        `json:"tags"`
 	StructuredOutput json.RawMessage `json:"structured_output,omitempty"`
 	Messages         json.RawMessage `json:"messages,omitempty"`
+	CreatedAt        Timestamp       `json:"created_at"`
+	UpdatedAt        Timestamp       `json:"updated_at"`
 	PullRequest      *struct {
 		URL string `json:"url"`
 	} `json:"pull_request"`
@@ -267,6 +324,8 @@ func (d *sessionDetailV1) toStatus() *SessionStatus {
 		StatusDetail: status,
 		Title:        d.Title,
 		URL:          "https://app.devin.ai/sessions/" + strings.TrimPrefix(d.SessionID, "devin-"),
+		CreatedAt:    d.CreatedAt,
+		UpdatedAt:    d.UpdatedAt,
 	}
 	if d.PullRequest != nil && d.PullRequest.URL != "" {
 		result.PullRequests = []PullRequest{{URL: d.PullRequest.URL}}

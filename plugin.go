@@ -1016,6 +1016,7 @@ func (p *Plugin) formatCheckSessionResult(sessionID string, status *devin.Sessio
 		b.WriteString(fmt.Sprintf("Status Detail: %s\n", status.StatusDetail))
 	}
 	b.WriteString(fmt.Sprintf("Archived: %v\n", status.IsArchived))
+	formatSessionAge(&b, status)
 	b.WriteString("\n")
 
 	if status.Title != "" {
@@ -1041,6 +1042,26 @@ func (p *Plugin) formatCheckSessionResult(sessionID string, status *devin.Sessio
 	}
 
 	return b.String()
+}
+
+// formatSessionAge reports when the session was last active, and says outright
+// when it is too old to continue. A caller deciding whether to resume a session
+// or open a fresh one gets no help from the status: Devin stops accepting
+// messages after 30 days, but an expired session still reads "suspended
+// (inactivity)" like any other, so a stage that trusts the status alone briefs a
+// session that will never read it. Age is the only thing that separates them.
+func formatSessionAge(b *strings.Builder, status *devin.SessionStatus) {
+	last := status.LastActivity()
+	if last.IsZero() {
+		return
+	}
+	days := int(time.Since(last).Hours() / 24)
+	b.WriteString(fmt.Sprintf("Last Activity: %s (%d days ago)\n", last.Format(time.RFC3339), days))
+	if !status.Resumable() {
+		b.WriteString("Resumable: NO — Devin does not continue a session more than 30 days " +
+			"after its last activity, so a message to this one is refused however its status " +
+			"reads. Carry its findings into a new session instead.\n")
+	}
 }
 
 // formatInsights renders session insights analysis into the output.

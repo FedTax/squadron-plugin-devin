@@ -233,11 +233,29 @@ The session ID is returned by `code_qa`, `code_review`, and `code_develop` when 
 |------|------|----------|-------------|
 | `session_id` | string | yes | The Devin session ID (e.g. `32fee96e7997499ca010301aa50eefce`) |
 
+The result also carries `Last Activity` and, when the session is past it, the 30-day resume
+window — see below.
+
 ### `send_message`
 
 Sends a follow-up message to an existing Devin session and waits for Devin to finish responding. Use this to continue a conversation with a session that is waiting for user input, for example to answer a question, give additional instructions, or request changes.
 
-The session must still be open (not archived). To keep sessions resumable after `code_qa`, `code_review`, or `code_develop` complete, set `archive_on_complete = "false"` in the plugin settings.
+The session must still be open (not archived) **and less than 30 days old**. Devin does not
+continue a session after that, and nothing in its status says so: an expired session reads
+`suspended` / `inactivity` exactly like one suspended an hour ago, so a stage that routes on status
+alone briefs a session that will never read the message. `check_session` therefore prints
+
+```
+Last Activity: 2026-07-28T09:50:00Z (43 days ago)
+Resumable: NO — Devin does not continue a session more than 30 days after its last activity...
+```
+
+from the session's `updated_at` (falling back to `created_at`; v3 sends epoch seconds and v1 sends
+RFC 3339, both decode). A session whose timestamps are absent reads as resumable — the refused send
+is then the evidence, which beats declaring a live session dead. Past the window, carry the
+findings into a new session rather than resuming.
+
+To keep sessions resumable after `code_qa`, `code_review`, or `code_develop` complete, set `archive_on_complete = "false"` in the plugin settings.
 
 After sending the message, the plugin reuses the same polling logic as the other tools, waiting until Devin finishes the follow-up work before returning its response.
 
